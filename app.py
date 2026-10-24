@@ -1,12 +1,10 @@
 import datetime as dt
-import os
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 import yfinance as yf
-import anthropic
 
 # ==============================================================================
 # 1. CONFIGURACIÓN DE LA PÁGINA
@@ -15,8 +13,8 @@ st.set_page_config(page_title="FinanBot IA", page_icon="📈", layout="wide")
 
 st.title("📈 FinanBot IA: Asistente Financiero & Cobertura")
 st.markdown(
-    "Analiza el rendimiento de una canasta de activos (bonos, acciones, LECAP, "
-    "BADLAR, inflación, SPY y BTC) y arma un diagnóstico según tu perfil de riesgo."
+    "Elegí los activos que quieras comparar (bonos, acciones, CEDEARs, oro, cripto) junto con "
+    "LECAP, BADLAR e inflación, y obtené un diagnóstico según tu perfil de riesgo."
 )
 
 # ==============================================================================
@@ -34,7 +32,53 @@ perfil = st.sidebar.selectbox("Perfil de riesgo", ["Conservador", "Moderado", "A
 # ==============================================================================
 # 3. DATOS Y CÁLCULOS
 # ==============================================================================
-TICKERS = ["AL30.BA", "GD30.BA", "GGAL.BA", "YPF.BA", "PAMP.BA", "BMA.BA", "SPY", "BTC-USD"]
+# Catálogo de activos por categoría (ticker de Yahoo Finance -> nombre).
+# Si algún ticker no devuelve datos en Yahoo, la app lo saltea sin romperse.
+CATALOGO = {
+    "Bonos soberanos": {
+        "AL29.BA": "Bonar 2029", "AL30.BA": "Bonar 2030", "AL35.BA": "Bonar 2035",
+        "GD29.BA": "Global 2029", "GD30.BA": "Global 2030", "GD35.BA": "Global 2035",
+        "GD38.BA": "Global 2038", "GD41.BA": "Global 2041", "GD46.BA": "Global 2046",
+    },
+    "Acciones argentinas": {
+        "GGAL.BA": "Galicia", "YPF.BA": "YPF", "PAMP.BA": "Pampa Energía",
+        "BMA.BA": "Banco Macro", "SUPV.BA": "Supervielle", "BYMA.BA": "BYMA",
+        "CEPU.BA": "Central Puerto", "TGSU2.BA": "Transp. Gas del Sur",
+        "TXAR.BA": "Ternium Argentina", "ALUA.BA": "Aluar", "LOMA.BA": "Loma Negra",
+        "CRES.BA": "Cresud", "EDN.BA": "Edenor", "TECO2.BA": "Telecom Argentina",
+    },
+    "CEDEARs": {
+        "AAPL.BA": "Apple", "MSFT.BA": "Microsoft", "GOOGL.BA": "Alphabet",
+        "AMZN.BA": "Amazon", "NVDA.BA": "Nvidia", "TSLA.BA": "Tesla",
+        "MELI.BA": "Mercado Libre", "KO.BA": "Coca-Cola",
+    },
+    "Internacional, oro y cripto": {
+        "SPY": "S&P 500 (ETF)", "QQQ": "Nasdaq 100 (ETF)", "GLD": "Oro (ETF)",
+        "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum",
+    },
+}
+SELECCION_INICIAL = {"AL30.BA", "GD30.BA", "GGAL.BA", "YPF.BA", "PAMP.BA", "BMA.BA", "SPY", "BTC-USD"}
+
+CATEGORIA = {t: cat for cat, d in CATALOGO.items() for t in d}
+CATEGORIA.update({"BADLAR": "Tasas en pesos", "LECAP": "Tasas en pesos", "IPC_UVA": "Inflación"})
+
+st.sidebar.divider()
+st.sidebar.subheader("🧺 Activos a analizar")
+seleccion = []
+for cat, activos in CATALOGO.items():
+    elegidos = st.sidebar.multiselect(
+        cat,
+        options=list(activos),
+        default=[t for t in activos if t in SELECCION_INICIAL],
+        format_func=lambda t, a=activos: f"{t.replace('.BA', '')} · {a[t]}",
+    )
+    seleccion += elegidos
+st.sidebar.caption("BADLAR, LECAP e inflación (UVA) se incluyen siempre como referencia.")
+
+if not seleccion:
+    st.warning("Elegí al menos un activo en la barra lateral para empezar.")
+    st.stop()
+TICKERS = tuple(sorted(seleccion))
 
 # Tasas simuladas (podés cambiarlas o conectarlas a una API del BCRA)
 TNA_BADLAR = 0.40
@@ -56,12 +100,12 @@ EXPLICACIONES = {
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cargar_datos(dias: int):
+def cargar_datos(dias: int, tickers: tuple):
     fin = dt.date.today()
     inicio = fin - dt.timedelta(days=dias)
 
     series = {}
-    for t in TICKERS:
+    for t in tickers:
         try:
             s = yf.Ticker(t).history(start=inicio, end=fin)["Close"]
             if not s.empty:
@@ -88,7 +132,7 @@ def cargar_datos(dias: int):
 
 
 with st.spinner("Descargando cotizaciones..."):
-    precios, retornos = cargar_datos(plazo_dias)
+    precios, retornos = cargar_datos(plazo_dias, TICKERS)
 
 if retornos is None:
     st.error("No se pudieron descargar datos de Yahoo Finance. Probá de nuevo en unos minutos.")
@@ -100,9 +144,12 @@ resumen = pd.DataFrame({
     "Rendimiento Acumulado (%)": (evolucion.iloc[-1] - 100).round(2),
     "Volatilidad Anualizada (%)": (retornos.std() * np.sqrt(252) * 100).round(2),
 }).sort_values("Rendimiento Acumulado (%)", ascending=False)
+resumen["Categoría"] = [CATEGORIA.get(t, "Otro") for t in resumen.index]
 
 # Rendimiento de la cartera sugerida (rebalanceo diario, simple)
 pesos = {k: v for k, v in CARTERAS[perfil].items() if k in retornos.columns}
+if not pesos:  # ningún activo de la cartera típica está seleccionado
+    pesos = {k: 1.0 for k in retornos.columns}
 total = sum(pesos.values())
 pesos = {k: v / total for k, v in pesos.items()}
 ret_cartera = sum(retornos[k] * w for k, w in pesos.items())
@@ -129,12 +176,12 @@ fig = px.line(
 st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("📋 Rendimiento y riesgo por activo")
-st.dataframe(resumen.style.highlight_max(axis=0, color="#c6f6d5"), use_container_width=True)
+st.dataframe(resumen.style.highlight_max(subset=["Rendimiento Acumulado (%)"], color="#c6f6d5"), use_container_width=True)
 
 # ==============================================================================
-# 5. DICTAMEN (reglas; acá podrías enchufar una API de IA real)
+# 5. DICTAMEN AUTOMÁTICO (según el perfil de riesgo)
 # ==============================================================================
-st.subheader("🤖 Recomendación de FinanBot IA")
+st.subheader("🤖 Recomendación de FinanBot")
 
 top3 = resumen.head(3).index.tolist()
 mas_volatil = resumen["Volatilidad Anualizada (%)"].idxmax()
@@ -148,63 +195,5 @@ st.info(f"""
 
 **Riesgo:** {EXPLICACIONES[perfil]} El activo más volátil fue **{mas_volatil}**, conviene seguirlo de cerca.
 """)
-
-# ==============================================================================
-# 6. ASESOR CON IA REAL (Claude). Si no hay API key, la app sigue funcionando.
-# ==============================================================================
-st.subheader("💬 Preguntale a la IA")
-
-
-def obtener_api_key():
-    try:
-        return st.secrets["ANTHROPIC_API_KEY"]
-    except Exception:
-        return os.environ.get("ANTHROPIC_API_KEY")
-
-
-def consultar_ia(pregunta: str, api_key: str) -> str:
-    client = anthropic.Anthropic(api_key=api_key)
-    contexto = f"""
-Perfil del inversor: {perfil}
-Monto a invertir: $ {monto:,.0f} ARS
-Período histórico analizado: {plazo_dias} días
-Cartera sugerida por la app: {cartera_txt}
-Rendimiento histórico de esa cartera: {rend_cartera:+.2f}%
-
-Tabla de rendimiento y volatilidad por activo:
-{resumen.to_string()}
-"""
-    system = (
-        "Sos FinanBot, un asistente financiero educativo para inversores argentinos. "
-        "Respondé en español rioplatense, claro y concreto, basándote en los datos que te paso. "
-        "Explicá riesgos, no prometas rendimientos futuros y aclará que no es asesoramiento financiero. "
-        "Máximo 250 palabras."
-    )
-    msg = client.messages.create(
-        model="claude-sonnet-5-5",
-        max_tokens=1000,
-        system=system,
-        messages=[{"role": "user", "content": f"{contexto}\n\nConsulta: {pregunta}"}],
-    )
-    return msg.content[0].text
-
-
-api_key = obtener_api_key()
-if not api_key:
-    st.caption(
-        "Para activar el asesor con IA, cargá tu `ANTHROPIC_API_KEY` en los secrets de la app "
-        "(ver instrucciones). Mientras tanto se muestra el dictamen automático de arriba."
-    )
-else:
-    pregunta = st.text_input(
-        "Tu consulta",
-        value="Analizá la cartera sugerida y decime qué riesgos tiene.",
-    )
-    if st.button("Consultar a FinanBot"):
-        with st.spinner("Pensando..."):
-            try:
-                st.markdown(consultar_ia(pregunta, api_key))
-            except Exception as e:
-                st.error(f"No se pudo consultar a la IA: {e}")
 
 st.caption("⚠️ Herramienta educativa. Rendimientos pasados no garantizan rendimientos futuros. No es asesoramiento financiero.")
