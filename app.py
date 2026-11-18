@@ -17,15 +17,10 @@ import yfinance as yf
 # Catálogo de activos por categoría (ticker de Yahoo Finance -> nombre).
 # Los tickers con sufijo .BA cotizan en pesos; el resto cotiza en dólares y se
 # convierte a pesos con el dólar CCL implícito.
+# Nota: la acción de YPF en Buenos Aires es YPFD.BA (YPF.BA no existe en Yahoo).
 CATALOGO = {
-    "Bonos soberanos": {
-        "AL29.BA": "Bonar 2029", "AL30.BA": "Bonar 2030", "AL35.BA": "Bonar 2035",
-        "AE38.BA": "Bonar 2038", "AL41.BA": "Bonar 2041",
-        "GD29.BA": "Global 2029", "GD30.BA": "Global 2030", "GD35.BA": "Global 2035",
-        "GD38.BA": "Global 2038", "GD41.BA": "Global 2041", "GD46.BA": "Global 2046",
-    },
     "Acciones argentinas": {
-        "GGAL.BA": "Galicia", "YPF.BA": "YPF", "PAMP.BA": "Pampa Energía",
+        "GGAL.BA": "Galicia", "YPFD.BA": "YPF", "PAMP.BA": "Pampa Energía",
         "BMA.BA": "Banco Macro", "SUPV.BA": "Supervielle", "BYMA.BA": "BYMA",
         "CEPU.BA": "Central Puerto", "TGSU2.BA": "Transportadora Gas del Sur",
         "TGNO4.BA": "Transportadora Gas del Norte", "TXAR.BA": "Ternium Argentina",
@@ -41,17 +36,27 @@ CATALOGO = {
         "WMT.BA": "Walmart", "JPM.BA": "JPMorgan", "XOM.BA": "Exxon Mobil",
         "MCD.BA": "McDonald's",
     },
+    "Renta fija internacional (USD)": {
+        "EMB": "Bonos soberanos emergentes (incluye Argentina)", "EMLC": "Bonos emergentes en moneda local",
+        "IEF": "Bonos del Tesoro EE.UU. 7-10 años", "TLT": "Bonos del Tesoro EE.UU. 20+ años",
+        "LQD": "Bonos corporativos grado inversor", "HYG": "Bonos corporativos alto rendimiento",
+    },
     "ETFs y oro (USD)": {
         "SPY": "S&P 500", "QQQ": "Nasdaq 100", "DIA": "Dow Jones", "IWM": "Small Caps EE.UU.",
         "EEM": "Mercados emergentes", "EWZ": "Brasil", "GLD": "Oro", "SLV": "Plata",
-        "TLT": "Bonos del Tesoro 20+ años",
     },
     "Criptoactivos (USD)": {
         "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum", "SOL-USD": "Solana",
         "BNB-USD": "BNB", "XRP-USD": "XRP", "ADA-USD": "Cardano",
     },
+    "Bonos argentinos (Yahoo suele no tener datos)": {
+        "AL29.BA": "Bonar 2029", "AL30.BA": "Bonar 2030", "AL35.BA": "Bonar 2035",
+        "AE38.BA": "Bonar 2038", "AL41.BA": "Bonar 2041",
+        "GD29.BA": "Global 2029", "GD30.BA": "Global 2030", "GD35.BA": "Global 2035",
+        "GD38.BA": "Global 2038", "GD41.BA": "Global 2041", "GD46.BA": "Global 2046",
+    },
 }
-SELECCION_INICIAL = {"AL30.BA", "GD30.BA", "GGAL.BA", "YPF.BA", "PAMP.BA", "BMA.BA", "SPY", "BTC-USD"}
+SELECCION_INICIAL = {"GGAL.BA", "YPFD.BA", "PAMP.BA", "BMA.BA", "EMB", "SPY", "BTC-USD"}
 
 TASAS = ["BADLAR", "LECAP", "IPC_UVA"]  # instrumentos de referencia (siempre incluidos)
 CATEGORIA = {t: cat for cat, d in CATALOGO.items() for t in d}
@@ -64,7 +69,7 @@ def es_usd(ticker):
 
 
 # Pares (acción local, ADR en EE.UU., acciones locales por ADR) para estimar el dólar CCL
-PARES_CCL = [("YPF.BA", "YPF", 1), ("GGAL.BA", "GGAL", 10), ("BMA.BA", "BMA", 10)]
+PARES_CCL = [("YPFD.BA", "YPF", 1), ("GGAL.BA", "GGAL", 10), ("BMA.BA", "BMA", 10)]
 DOLAR_OFICIAL = "ARS=X"  # respaldo: dólar oficial según Yahoo Finance
 
 
@@ -234,21 +239,21 @@ def construir_cartera_dinamica(perfil, plazo, columnas):
 
     # 1) Base según el plazo
     if plazo <= 60:       # corto plazo: liquidez y tasa
-        pesos.update({"LECAP": 0.40, "BADLAR": 0.30, "IPC_UVA": 0.20, "AL30.BA": 0.10})
+        pesos.update({"LECAP": 0.40, "BADLAR": 0.30, "IPC_UVA": 0.20, "EMB": 0.10})
     elif plazo <= 180:    # mediano plazo: equilibrio
-        pesos.update({"LECAP": 0.25, "AL30.BA": 0.25, "GGAL.BA": 0.20, "YPF.BA": 0.15, "SPY": 0.15})
+        pesos.update({"LECAP": 0.25, "EMB": 0.25, "GGAL.BA": 0.20, "YPFD.BA": 0.15, "SPY": 0.15})
     else:                 # largo plazo: renta variable y cripto
-        pesos.update({"GGAL.BA": 0.25, "YPF.BA": 0.25, "AL30.BA": 0.20, "SPY": 0.15, "BTC-USD": 0.15})
+        pesos.update({"GGAL.BA": 0.25, "YPFD.BA": 0.25, "EMB": 0.20, "SPY": 0.15, "BTC-USD": 0.15})
 
     # 2) Ajuste según el perfil
     if perfil == "Conservador":
         pesos["LECAP"] = pesos.get("LECAP", 0) + 0.25
         pesos["BADLAR"] = pesos.get("BADLAR", 0) + 0.20
-        for k in ["BTC-USD", "GGAL.BA", "YPF.BA"]:
+        for k in ["BTC-USD", "GGAL.BA", "YPFD.BA"]:
             if k in pesos:
                 pesos[k] *= 0.3
     elif perfil == "Agresivo":
-        for k in ["BTC-USD", "GGAL.BA", "YPF.BA", "SPY"]:
+        for k in ["BTC-USD", "GGAL.BA", "YPFD.BA", "SPY"]:
             if k in pesos:
                 pesos[k] *= 1.8
         for k in ["LECAP", "BADLAR"]:
