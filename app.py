@@ -17,8 +17,15 @@ import yfinance as yf
 # Catálogo de activos por categoría (ticker de Yahoo Finance -> nombre).
 # Los tickers con sufijo .BA cotizan en pesos; el resto cotiza en dólares y se
 # convierte a pesos con el dólar CCL implícito.
-# Nota: la acción de YPF en Buenos Aires es YPFD.BA (YPF.BA no existe en Yahoo).
+# Notas: la acción de YPF en Buenos Aires es YPFD.BA (YPF.BA no existe en Yahoo).
+# Yahoo no tiene series de bonos argentinos: esos precios vienen de data912 (BYMA, en pesos).
 CATALOGO = {
+    "Bonos argentinos (datos: data912)": {
+        "AL29.BA": "Bonar 2029", "AL30.BA": "Bonar 2030", "AL35.BA": "Bonar 2035",
+        "AE38.BA": "Bonar 2038", "AL41.BA": "Bonar 2041",
+        "GD29.BA": "Global 2029", "GD30.BA": "Global 2030", "GD35.BA": "Global 2035",
+        "GD38.BA": "Global 2038", "GD41.BA": "Global 2041", "GD46.BA": "Global 2046",
+    },
     "Acciones argentinas": {
         "GGAL.BA": "Galicia", "YPFD.BA": "YPF", "PAMP.BA": "Pampa Energía",
         "BMA.BA": "Banco Macro", "SUPV.BA": "Supervielle", "BYMA.BA": "BYMA",
@@ -49,13 +56,8 @@ CATALOGO = {
         "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum", "SOL-USD": "Solana",
         "BNB-USD": "BNB", "XRP-USD": "XRP", "ADA-USD": "Cardano",
     },
-    "Bonos argentinos (Yahoo suele no tener datos)": {
-        "AL29.BA": "Bonar 2029", "AL30.BA": "Bonar 2030", "AL35.BA": "Bonar 2035",
-        "AE38.BA": "Bonar 2038", "AL41.BA": "Bonar 2041",
-        "GD29.BA": "Global 2029", "GD30.BA": "Global 2030", "GD35.BA": "Global 2035",
-        "GD38.BA": "Global 2038", "GD41.BA": "Global 2041", "GD46.BA": "Global 2046",
-    },
 }
+BONOS_ARG = set(CATALOGO["Bonos argentinos (datos: data912)"])  # se descargan de data912
 SELECCION_INICIAL = {"GGAL.BA", "YPFD.BA", "PAMP.BA", "BMA.BA", "EMB", "SPY", "BTC-USD"}
 
 TASAS = ["BADLAR", "LECAP", "IPC_UVA"]  # instrumentos de referencia (siempre incluidos)
@@ -92,6 +94,37 @@ def calcular_dolar(precios):
     return None, None
 
 
+URL_DATA912 = "https://data912.com/historical/bonds/"  # API pública y gratuita (BYMA), sin clave
+
+
+def serie_bono_data912(ticker, inicio):
+    """Precio de cierre diario (en pesos) de un bono argentino desde data912.
+
+    Son precios limpios: no incluyen cupones ni amortizaciones, por eso en períodos que
+    cruzan los pagos (enero y julio) el rendimiento de los bonos queda subestimado.
+    """
+    base = ticker.replace(".BA", "")
+    for intento in range(2):
+        r = requests.get(URL_DATA912 + base, timeout=20, headers={"User-Agent": "Mozilla/5.0 (FinanBot)"})
+        if r.status_code == 429 and intento == 0:  # límite de pedidos: se espera y se reintenta
+            import time
+            time.sleep(1.5)
+            continue
+        r.raise_for_status()
+        break
+    datos = r.json()
+    if not datos:
+        return None
+    df = pd.DataFrame(datos)
+    fechas = pd.to_datetime(df["date"], errors="coerce")
+    if getattr(fechas.dt, "tz", None) is not None:
+        fechas = fechas.dt.tz_localize(None)
+    s = pd.Series(pd.to_numeric(df["c"], errors="coerce").values, index=fechas.dt.normalize()).dropna()
+    s = s[~s.index.duplicated(keep="last")].sort_index()
+    s = s[s.index >= pd.Timestamp(inicio)]
+    return s if not s.empty else None
+
+
 def descargar_precios(dias, tickers):
     """Baja precios de cierre y pasa todo a PESOS.
 
@@ -110,6 +143,8 @@ def descargar_precios(dias, tickers):
 
     def bajar(t):
         try:
+            if t in BONOS_ARG:  # Yahoo no tiene bonos argentinos: se usa data912
+                return t, serie_bono_data912(t, inicio)
             s = yf.Ticker(t).history(start=inicio, end=fin)["Close"]
             if s.empty:
                 return t, None
@@ -236,14 +271,15 @@ def calcular_resumen(retornos):
 def construir_cartera_dinamica(perfil, plazo, columnas):
     """Pesos sugeridos según plazo de inversión y perfil de riesgo."""
     pesos = {}
+    bono = "AL30.BA" if "AL30.BA" in columnas else "EMB"  # bono soberano de la fórmula
 
     # 1) Base según el plazo
     if plazo <= 60:       # corto plazo: liquidez y tasa
-        pesos.update({"LECAP": 0.40, "BADLAR": 0.30, "IPC_UVA": 0.20, "EMB": 0.10})
+        pesos.update({"LECAP": 0.40, "BADLAR": 0.30, "IPC_UVA": 0.20, bono: 0.10})
     elif plazo <= 180:    # mediano plazo: equilibrio
-        pesos.update({"LECAP": 0.25, "EMB": 0.25, "GGAL.BA": 0.20, "YPFD.BA": 0.15, "SPY": 0.15})
+        pesos.update({"LECAP": 0.25, bono: 0.25, "GGAL.BA": 0.20, "YPFD.BA": 0.15, "SPY": 0.15})
     else:                 # largo plazo: renta variable y cripto
-        pesos.update({"GGAL.BA": 0.25, "YPFD.BA": 0.25, "EMB": 0.20, "SPY": 0.15, "BTC-USD": 0.15})
+        pesos.update({"GGAL.BA": 0.25, "YPFD.BA": 0.25, bono: 0.20, "SPY": 0.15, "BTC-USD": 0.15})
 
     # 2) Ajuste según el perfil
     if perfil == "Conservador":
@@ -403,7 +439,15 @@ def optimizar_cartera(retornos, perfil, plazo, n_nube=3000):
     cov = 0.9 * cov + 0.1 * np.diag(np.diag(cov))  # regulariza la covarianza
     rf = float((1 + retornos["LECAP"].iloc[-1]) ** 365 - 1)
 
-    w = _resolver(mu, cov, cfg["objetivo"], cfg["tope"], rf)
+    objetivo = cfg["objetivo"]
+    cambio_objetivo = False
+    if objetivo == "sharpe" and (mu - rf).max() <= 0:
+        # Si ningún activo rinde más que la tasa libre de riesgo, el ratio de Sharpe es negativo
+        # para cualquier cartera y maximizarlo premia el riesgo (elige lo más volátil).
+        # En ese caso se minimiza la volatilidad.
+        objetivo, cambio_objetivo = "min_vol", True
+
+    w = _resolver(mu, cov, objetivo, cfg["tope"], rf)
 
     pesos = {t: float(wi) * (1 - colchon) for t, wi in zip(riesgosos, w) if wi > 0}
     for t, parte in COLCHON.items():
@@ -421,7 +465,8 @@ def optimizar_cartera(retornos, perfil, plazo, n_nube=3000):
         nube = pd.DataFrame({"Volatilidad (%)": np.sqrt(np.einsum("ij,jk,ik->i", W, cov, W)) * 100,
                              "Retorno esperado (%)": (W @ mu) * 100})
     return {
-        "pesos": pesos, "colchon": colchon, "objetivo": cfg["objetivo"], "tope": cfg["tope"],
+        "pesos": pesos, "colchon": colchon, "objetivo": objetivo, "tope": cfg["tope"],
+        "cambio_objetivo": cambio_objetivo, "rf": rf,
         "riesgosos": riesgosos, "nube": nube,
         "optimo": punto(w), "igual": punto(np.full(len(riesgosos), 1.0 / len(riesgosos))),
     }
@@ -429,9 +474,11 @@ def optimizar_cartera(retornos, perfil, plazo, n_nube=3000):
 
 def describir_metodo(opt):
     objetivo = "mínima volatilidad" if opt["objetivo"] == "min_vol" else "mejor relación retorno/riesgo"
+    extra = (" Como ningún activo superó a la tasa libre de riesgo en el período, se minimizó la volatilidad."
+             if opt.get("cambio_objetivo") else "")
     return (f"optimización sobre tus {len(opt['riesgosos'])} activos con riesgo (objetivo: {objetivo}; "
             f"máximo {opt['tope']:.0%} por activo) más un colchón de {opt['colchon']:.0%} en tasas "
-            f"(LECAP, BADLAR e inflación).")
+            f"(LECAP, BADLAR e inflación)." + extra)
 
 
 def validar_fuera_de_muestra(retornos, perfil, plazo, pesos_reglas, corte=0.7):
@@ -643,6 +690,9 @@ c4.metric(
     f"$ {monto_final:,.0f} ARS",
     f"{ganancia:+,.0f} ARS ({rend_cartera:+.2f}%)",
 )
+if any(t in BONOS_ARG for t in TICKERS):
+    st.caption("Los bonos argentinos usan precios limpios de data912 (BYMA, en pesos): no incluyen cupones ni amortizaciones, "
+               "por lo que en períodos que cruzan enero o julio su rendimiento aparece subestimado.")
 if dolar and any(es_usd(t) for t in TICKERS):
     st.caption(f"Los activos en USD (ETFs y cripto) se pasaron a pesos con el {dolar['fuente']}. "
                f"Valor actual: $ {dolar['valor']:,.2f} por dólar.")
@@ -664,6 +714,10 @@ else:
         f"**{perfil}**, logra la {'**menor volatilidad**' if opt['objetivo'] == 'min_vol' else '**mejor relación retorno/riesgo**'}, "
         f"sin pasar de {opt['tope']:.0%} en un solo activo, y suma un **colchón de {opt['colchon']:.0%}** en tasas."
     )
+    if opt.get("cambio_objetivo"):
+        st.info("Ningún activo superó a la tasa libre de riesgo en este período (la LECAP rinde "
+                f"{opt['rf']:.1%} anual). Con ese escenario maximizar el ratio de Sharpe no tiene sentido, "
+                "así que el optimizador **minimizó la volatilidad**.")
     st.plotly_chart(grafico_frontera(opt), width="stretch")
     val = validar_fuera_de_muestra(retornos, perfil, plazo_dias, pesos_reglas)
     if val:
@@ -709,10 +763,10 @@ with st.expander("📘 Metodología y supuestos"):
     st.markdown("""
 - **Datos:** precios de cierre de Yahoo Finance (`yfinance`) en el plazo elegido.
 - **Moneda:** todo se expresa en pesos. Los activos en USD se convierten con el dólar CCL implícito (mediana de YPF, GGAL y BMA contra sus ADR); si no se puede calcular, se usa el dólar oficial de Yahoo.
-- **Tasas:** BADLAR (TNA) e inflación mensual se leen de la API oficial del BCRA; la TEM de LECAP se estima desde BADLAR (no hay fuente gratuita oficial). Podés pasar a modo manual y se capitalizan día a día.
+- **Datos:** acciones, CEDEARs, ETFs y cripto de Yahoo Finance; bonos argentinos de data912 (BYMA).\n- **Tasas:** BADLAR (TNA) e inflación mensual se leen de la API oficial del BCRA; la TEM de LECAP se estima desde BADLAR (no hay fuente gratuita oficial). Podés pasar a modo manual y se capitalizan día a día.
 - **Calendario:** se usan los 7 días de la semana, repitiendo el último precio cuando el mercado está cerrado.
 - **Cartera por reglas:** pesos fijos según plazo y perfil.
-- **Cartera optimizada:** minimiza la volatilidad (conservador) o maximiza el ratio de Sharpe (moderado y agresivo) con tus activos, sin ventas en corto y con un tope por activo. Los retornos esperados se acercan a su promedio y la covarianza se regulariza para que no dependa tanto de unos pocos días. Un colchón en tasas depende del perfil y del plazo.
+- **Cartera optimizada:** minimiza la volatilidad (conservador) o maximiza el ratio de Sharpe (moderado y agresivo) con tus activos (si ninguno supera a la tasa libre de riesgo, minimiza la volatilidad), sin ventas en corto y con un tope por activo. Los retornos esperados se acercan a su promedio y la covarianza se regulariza para que no dependa tanto de unos pocos días. Un colchón en tasas depende del perfil y del plazo.
 - **Supuestos comunes:** rebalanceo diario (simplificación), sin comisiones ni impuestos.
 - **Métricas:** volatilidad anualizada (raíz de 365), caída máxima desde el pico y retorno/riesgo (retorno anualizado dividido volatilidad).
 - **Alcance:** es un *backtest* con datos pasados, no una proyección.
